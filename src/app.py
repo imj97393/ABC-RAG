@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from groq import Groq
 
 # 페이지 기본 설정 (와이드 모드, 대시보드 타이틀 및 아이콘)
 st.set_page_config(
@@ -213,6 +214,159 @@ def highlight_keyword(text: str, keyword: str) -> str:
         return text
 
 
+def retrieve_relevant_books(query: str, df: pd.DataFrame, top_n: int = 10) -> list:
+    """사용자 질문에서 핵심 키워드를 추출하여 데이터프레임에서 관련성이 높은 도서 목록을 필터링합니다.
+
+    - 불용어를 제외한 키워드들을 추출합니다.
+    - 도서명, 내용, 저자, 출판사 등에서 키워드 매칭 여부에 따라 점수를 부과합니다.
+    - 점수 기반으로 내림차순 정렬하고 상위 top_n개의 도서를 반환합니다.
+    """
+    if df.empty or not query:
+        return []
+
+    # 1. 사용자 질문 정제 및 키워드 추출
+    # 특수문자 제거
+    cleaned_query = re.sub(r"[^\w\s]", " ", query)
+    words = cleaned_query.split()
+    
+    # 2글자 미만이거나 불용어에 해당하는 단어 필터링
+    stopwords = {
+        "추천", "추천해", "추천해줘", "추천해줄래", "추천해주라", "추천한다",
+        "알려줘", "알려줄래", "보여줘", "있어", "있니", "있나요", "있습니까", "있을까",
+        "어떤", "무슨", "도서", "책", "교재", "분야", "관련", "관련된", "대해", "대해서",
+        "대한", "찾아", "찾아줘", "소개", "소개해", "가장", "제일", "요즘", "베스트",
+        "셀러", "베스트셀러", "인기", "인기있는", "재미있는", "쉬운", "어려운"
+    }
+    
+    keywords = [w for w in words if len(w) >= 2 and w not in stopwords]
+    
+    # 만약 불용어를 빼고 남은 키워드가 없다면 원본 단어 중 1글자 이상인 것들을 사용
+    if not keywords:
+        keywords = [w for w in words if w not in stopwords]
+        
+    if not keywords:
+        # 그래도 없다면 전체 단어 사용
+        keywords = words
+
+    # 2. 도서별 점수 계산
+    scores = []
+    for idx, row in df.iterrows():
+        score = 0
+        book_title = str(row.get("도서명", "")).lower()
+        book_desc = str(row.get("내용", "")).lower()
+        book_author = str(row.get("저자", "")).lower()
+        book_pub = str(row.get("출판사", "")).lower()
+        
+        for kw in keywords:
+            kw_lower = kw.lower()
+            # 제목에 포함 시 가중치 15점
+            if kw_lower in book_title:
+                score += 15 + (book_title.find(kw_lower) == 0) * 5  # 앞에 나올수록 조금 더 가산점
+            # 저자에 포함 시 가중치 8점
+            if kw_lower in book_author:
+                score += 8
+            # 내용에 포함 시 가중치 3점
+            if kw_lower in book_desc:
+                # 내용에서 키워드가 출현하는 횟수 세기
+                count = book_desc.count(kw_lower)
+                score += min(count * 3, 15)  # 최대 15점까지만 가산
+            # 출판사에 포함 시 가중치 5점
+            if kw_lower in book_pub:
+                score += 5
+                
+        # 매칭된 키워드가 있는 경우에만 후보에 추가
+        if score > 0:
+            # 동점인 경우 판매지수가 높은 책이 우선되도록 미세한 점수 추가
+            sales_idx = row.get("판매지수_값", 0)
+            score += min(sales_idx / 100000.0, 0.99)  # 최대 0.99점 추가
+            scores.append((idx, score))
+            
+    if not scores:
+        return []
+
+    # 3. 점수 높은 순 정렬 및 상위 N개 추출
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top_indices = [idx for idx, scr in scores[:top_n]]
+    top_books_df = df.loc[top_indices]
+    
+    books_list = []
+    for _, row in top_books_df.iterrows():
+        books_list.append({
+            "순위": row.get("순위", "정보 없음"),
+            "도서명": row.get("도서명", "제목 없음"),
+            "저자": row.get("저자", "저자 미상"),
+            "출판사": row.get("출판사", "출판사 정보 없음"),
+            "출판일": row.get("출판일", "날짜 없음"),
+            "판매가": row.get("판매가", 0),
+            "내용": row.get("내용", "소개 없음"),
+            "링크": row.get("링크", "")
+        })
+    return books_list
+
+
+def recommend_books_via_groq(query: str, relevant_books: list, api_key: str, model: str) -> str:
+    """Groq API를 사용하여 도서 추천 응답을 생성합니다.
+
+    - 제공된 relevant_books 데이터를 Context로 활용합니다.
+    - 해당 도서 목록에 적절한 책이 없으면 "추천할 도서가 없습니다."라고 답변합니다.
+    - 추천 시 마크다운 링크 형식 [도서명](링크)을 필수로 포함합니다.
+    """
+    try:
+        client = Groq(api_key=api_key)
+    except Exception as e:
+        return f"Groq 클라이언트 초기화 실패: {str(e)}"
+
+    # 도서 컨텍스트 구성
+    if not relevant_books:
+        context_str = "제공된 관련 도서 목록이 비어 있습니다."
+    else:
+        context_str = "아래는 현재 데이터베이스(IT/모바일 베스트셀러)에서 검색된 관련 도서 목록입니다:\n\n"
+        for i, book in enumerate(relevant_books):
+            context_str += (
+                f"[{i+1}] 도서명: {book['도서명']}\n"
+                f"- 순위: {book['순위']}위\n"
+                f"- 저자: {book['저자']}\n"
+                f"- 출판사: {book['출판사']}\n"
+                f"- 출판일: {book['출판일']}\n"
+                f"- 판매가: {book['판매가']:,}원\n"
+                f"- 소개내용: {book['내용']}\n"
+                f"- 상세링크: {book['링크']}\n\n"
+            )
+
+    system_prompt = (
+        "당신은 예스24 IT/모바일 베스트셀러 도서 데이터를 기반으로 책을 추천하는 전문 AI 어시스턴트입니다.\n"
+        "아래 규칙을 엄격히 준수하여 한국어로 답변하세요:\n\n"
+        "1. 제공된 [도서 목록] 컨텍스트의 정보만을 기반으로 추천을 수행하십시오.\n"
+        "2. 만약 제공된 도서 목록에 사용자가 찾는 분야의 도서가 없거나 질문에 부합하는 도서가 전혀 없다면, "
+        "절대 임의로 도서 정보를 지어내거나 외부 도서를 추천하지 마십시오. 반드시 한국어로 '추천할 도서가 없습니다.'라고 명확하게 답변하십시오.\n"
+        "3. 책을 추천할 때는 해당 도서의 정보(순위, 저자, 출판사, 판매가, 내용 요약 등)를 친절히 설명하십시오.\n"
+        "4. 책을 언급할 때는 반드시 '[도서명](상세링크)' 형식을 적용하여 사용자가 링크를 클릭해 바로 예스24 도서 상세 페이지로 이동할 수 있게 마크다운 링크를 제공하십시오. "
+        "예: [Do it! 점프 투 파이썬](https://www.yes24.com/product/goods/119293186)\n"
+        "5. 답변에 링크를 작성할 때는 컨텍스트에 주어진 '상세링크' 값을 그대로 사용하십시오. 임의로 도메인을 변경하거나 위조하지 마십시오."
+    )
+
+    user_content = (
+        f"[도서 목록]\n{context_str}\n\n"
+        f"[사용자 질문]\n{query}\n\n"
+        f"위 도서 목록 내에서 사용자의 질문에 가장 적합한 도서를 추천하고 그 이유를 설명해 주세요. "
+        f"만약 조건에 맞는 도서가 전혀 없다면 반드시 '추천할 도서가 없습니다.'라고 답하세요."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.3,
+            max_tokens=2048
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Groq API 호출 중 오류가 발생했습니다: {str(e)}"
+
+
 def main():
     # 데이터 로드
     df = load_and_preprocess_data(DATA_FILE)
@@ -222,12 +376,28 @@ def main():
         st.info(f"확인 경로: {DATA_FILE}")
         return
 
+    # 사이드바 설정 (Groq API Key 및 모델)
+    st.sidebar.title("🔑 AI 추천 설정")
+    st.sidebar.markdown("Groq Cloud에서 발급받은 API Key를 입력하여 도서 추천 챗봇을 이용하실 수 있습니다.")
+    
+    groq_api_key = st.sidebar.text_input("Groq API Key", type="password", help="gsk_로 시작하는 Groq API Key를 입력하세요.")
+    
+    model_options = [
+        "llama-3.3-70b-versatile",
+        "llama3-8b-8192",
+        "mixtral-8x7b-32768"
+    ]
+    selected_model = st.sidebar.selectbox("LLM 모델 선택", model_options, index=0)
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("[Groq Console 바로가기](https://console.groq.com/keys)")
+
     # 대시보드 타이틀
     st.markdown('<div class="main-header">YES24 IT/모바일 베스트셀러 대시보드</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-header">실시간으로 수집된 예스24 IT/모바일 카테고리의 베스트셀러 데이터를 바탕으로 트렌드를 분석하고 도서를 검색합니다.</div>', unsafe_allow_html=True)
 
-    # 탭 구성 (시각화 분석 / 도서 검색)
-    tab1, tab2 = st.tabs(["📊 탐색적 데이터 분석 (EDA)", "🔍 키워드 검색 및 도서 상세"])
+    # 탭 구성 (시각화 분석 / 도서 검색 / 챗봇)
+    tab1, tab2, tab3 = st.tabs(["📊 탐색적 데이터 분석 (EDA)", "🔍 키워드 검색 및 도서 상세", "🤖 AI 도서 추천 챗봇"])
 
     # --- 탭 1: 탐색적 데이터 분석 (EDA) ---
     with tab1:
@@ -466,6 +636,50 @@ def main():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+    # --- 탭 3: AI 도서 추천 챗봇 ---
+    with tab3:
+        st.subheader("🤖 AI 도서 추천 챗봇")
+        st.write("질문을 입력하시면 예스24 IT/모바일 베스트셀러 도서 목록 내에서 관련 책을 추천해 드립니다.")
+        
+        # API Key 검증
+        if not groq_api_key:
+            st.info("💡 챗봇을 이용하시려면 사이드바에서 **Groq API Key**를 입력해 주세요.")
+        else:
+            # 챗봇 세션 상태 초기화
+            if "messages" not in st.session_state:
+                st.session_state.messages = []
+                
+            # 이전 대화 메시지 출력
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+                    
+            # 사용자 입력 처리
+            if user_input := st.chat_input("추천받고 싶은 도서 분야나 키워드를 물어보세요! (예: 파이썬 입문책 추천해줘, 클로드 활용 가이드 있나요?)"):
+                # 사용자 메시지 렌더링
+                with st.chat_message("user"):
+                    st.markdown(user_input)
+                # 세션에 저장
+                st.session_state.messages.append({"role": "user", "content": user_input})
+                
+                # AI 답변 생성
+                with st.chat_message("assistant"):
+                    with st.spinner("관련 도서를 검색하고 추천 답변을 생성하고 있습니다..."):
+                        # 1. 관련 도서 검색 (Retrieval)
+                        relevant_books = retrieve_relevant_books(user_input, df)
+                        
+                        # 2. Groq API 호출을 통한 답변 생성
+                        ai_response = recommend_books_via_groq(
+                            query=user_input, 
+                            relevant_books=relevant_books, 
+                            api_key=groq_api_key, 
+                            model=selected_model
+                        )
+                        st.markdown(ai_response)
+                        
+                # 세션에 저장
+                st.session_state.messages.append({"role": "assistant", "content": ai_response})
 
 
 if __name__ == "__main__":
