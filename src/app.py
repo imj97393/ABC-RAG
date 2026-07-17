@@ -11,6 +11,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from groq import Groq
+from vector_db import ChromaDBManager
+import json
 
 # 페이지 기본 설정 (와이드 모드, 대시보드 타이틀 및 아이콘)
 st.set_page_config(
@@ -304,11 +306,89 @@ def retrieve_relevant_books(query: str, df: pd.DataFrame, top_n: int = 10) -> li
     return books_list
 
 
-def recommend_books_via_groq(query: str, relevant_books: list, api_key: str, model: str) -> str:
+def query_books_by_numeric_metrics(
+    df: pd.DataFrame,
+    min_price: int = None,
+    max_price: int = None,
+    min_sales: int = None,
+    max_sales: int = None,
+    sort_by: str = None,
+    ascending: bool = False,
+    top_n: int = 10
+) -> list:
+    """사용자가 가격이나 판매지수를 명시했을 때 데이터프레임을 직접 정렬하고 범위를 필터링하여 결과를 반환합니다.
+
+    Args:
+        df (pd.DataFrame): 예스24 베스트셀러 도서 데이터프레임
+        min_price (int, optional): 최소 가격
+        max_price (int, optional): 최대 가격
+        min_sales (int, optional): 최소 판매지수
+        max_sales (int, optional): 최대 판매지수
+        sort_by (str, optional): 정렬 기준 ("판매가" 또는 "판매지수_값")
+        ascending (bool): 오름차순 여부 (기본값: False)
+        top_n (int): 반환할 도서 개수 (기본값: 10)
+
+    Returns:
+        list: 정렬 및 필터링이 완료된 도서 정보 딕셔너리 리스트
+    """
+    if df.empty:
+        return []
+
+    filtered_df = df.copy()
+
+    # 1. 가격 필터링 (판매가 컬럼 기준)
+    if min_price is not None:
+        filtered_df = filtered_df[filtered_df["판매가"] >= min_price]
+    if max_price is not None:
+        filtered_df = filtered_df[filtered_df["판매가"] <= max_price]
+
+    # 2. 판매지수 필터링 (판매지수_값 컬럼 기준)
+    if min_sales is not None:
+        filtered_df = filtered_df[filtered_df["판매지수_값"] >= min_sales]
+    if max_sales is not None:
+        filtered_df = filtered_df[filtered_df["판매지수_값"] <= max_sales]
+
+    # 3. 정렬 처리
+    if sort_by:
+        sort_col = None
+        if sort_by in ["판매가", "가격"]:
+            sort_col = "판매가"
+        elif sort_by in ["정가"]:
+            sort_col = "정가"
+        elif sort_by in ["판매지수", "판매지수_값", "인기"]:
+            sort_col = "판매지수_값"
+        elif sort_by in ["할인율", "할인율_값"]:
+            sort_col = "할인율_값"
+
+        if sort_col and sort_col in filtered_df.columns:
+            filtered_df = filtered_df.sort_values(by=sort_col, ascending=ascending)
+    else:
+        # 특별한 정렬 기준이 지정되지 않았으나 필터링 등이 걸린 경우 판매지수 높은 인기 순을 기본값으로 정렬
+        if "판매지수_값" in filtered_df.columns:
+            filtered_df = filtered_df.sort_values(by="판매지수_값", ascending=False)
+
+    # 4. 결과 가공
+    result_books = []
+    for _, row in filtered_df.head(top_n).iterrows():
+        result_books.append({
+            "순위": row.get("순위", "정보 없음"),
+            "도서명": row.get("도서명", "제목 없음"),
+            "저자": row.get("저자", "저자 미상"),
+            "출판사": row.get("출판사", "출판사 정보 없음"),
+            "출판일": row.get("출판일", "날짜 없음"),
+            "판매가": row.get("판매가", 0),
+            "내용": row.get("내용", "소개 없음"),
+            "링크": row.get("링크", "")
+        })
+
+    return result_books
+
+
+def recommend_books_via_groq(query: str, relevant_books: list, api_key: str, model: str, df: pd.DataFrame = None) -> str:
     """Groq API를 사용하여 도서 추천 응답을 생성합니다.
 
-    - 제공된 relevant_books 데이터를 Context로 활용합니다.
-    - 해당 도서 목록에 적절한 책이 없으면 "추천할 도서가 없습니다."라고 답변합니다.
+    - 가격이나 판매지수에 관련된 수치 연산 및 정렬이 필요한 경우 Tool Calling을 수행합니다.
+    - 일반 질의의 경우 제공된 relevant_books 데이터를 Context로 활용합니다.
     - 추천 시 마크다운 링크 형식 [도서명](링크)을 필수로 포함합니다.
     """
     try:
@@ -336,7 +416,7 @@ def recommend_books_via_groq(query: str, relevant_books: list, api_key: str, mod
     system_prompt = (
         "당신은 예스24 IT/모바일 베스트셀러 도서 데이터를 기반으로 책을 추천하는 전문 AI 어시스턴트입니다.\n"
         "아래 규칙을 엄격히 준수하여 한국어로 답변하세요:\n\n"
-        "1. 제공된 [도서 목록] 컨텍스트의 정보만을 기반으로 추천을 수행하십시오.\n"
+        "1. 제공된 [도서 목록] 컨텍스트 또는 도구(Tool) 호출을 통해 가져온 결과만을 기반으로 추천을 수행하십시오.\n"
         "2. 만약 제공된 도서 목록에 사용자가 찾는 분야의 도서가 없거나 질문에 부합하는 도서가 전혀 없다면, "
         "절대 임의로 도서 정보를 지어내거나 외부 도서를 추천하지 마십시오. 반드시 한국어로 '추천할 도서가 없습니다.'라고 명확하게 답변하십시오.\n"
         "3. 책을 추천할 때는 해당 도서의 정보(순위, 저자, 출판사, 판매가, 내용 요약 등)를 친절히 설명하십시오.\n"
@@ -348,23 +428,143 @@ def recommend_books_via_groq(query: str, relevant_books: list, api_key: str, mod
     user_content = (
         f"[도서 목록]\n{context_str}\n\n"
         f"[사용자 질문]\n{query}\n\n"
-        f"위 도서 목록 내에서 사용자의 질문에 가장 적합한 도서를 추천하고 그 이유를 설명해 주세요. "
+        f"위 도서 목록 내 또는 도구 호출을 통해 적절한 도서를 추천하고 그 이유를 설명해 주세요. "
         f"만약 조건에 맞는 도서가 전혀 없다면 반드시 '추천할 도서가 없습니다.'라고 답하세요."
     )
 
+    # 수치 분석용 도구(Tool) 정의
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "query_books_by_numeric_metrics",
+                "description": (
+                    "사용자가 도서의 가격대 조건(최소 가격, 최대 가격), 판매지수 범위 조건, "
+                    "혹은 수치 정렬(예: 가격 싼 순서, 판매지수 높은 인기 순서 등)을 요구하여 질문했을 때 호출하여 데이터프레임을 직접 정렬/필터링합니다."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "min_price": {
+                            "type": "integer",
+                            "description": "최소 가격 필터 조건 (원 단위, 예: 10000)"
+                        },
+                        "max_price": {
+                            "type": "integer",
+                            "description": "최대 가격 필터 조건 (원 단위, 예: 25000)"
+                        },
+                        "min_sales": {
+                            "type": "integer",
+                            "description": "최소 판매지수 조건 (예: 5000)"
+                        },
+                        "max_sales": {
+                            "type": "integer",
+                            "description": "최대 판매지수 조건"
+                        },
+                        "sort_by": {
+                            "type": "string",
+                            "enum": ["판매가", "판매지수_값"],
+                            "description": "정렬 기준 컬럼 ('판매가'는 가격 기준, '판매지수_값'은 인기도/판매량 기준)"
+                        },
+                        "ascending": {
+                            "type": "boolean",
+                            "description": "오름차순 여부. True이면 낮은 순(가격 싼 순), False이면 높은 순(가격 비싼 순, 판매지수 높은 인기 순)으로 정렬합니다."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }
+    ]
+
     try:
+        # 1차 호출 (도구 호출 필요 여부 체크)
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ],
-            temperature=0.3,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.2,
             max_tokens=2048
         )
-        return response.choices[0].message.content
+        
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
+        
+        # 도구 호출이 필요하고 데이터프레임이 전달된 경우
+        if tool_calls and df is not None:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+                response_message
+            ]
+            
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                
+                if function_name == "query_books_by_numeric_metrics":
+                    # 인자 파싱
+                    min_p = function_args.get("min_price")
+                    max_p = function_args.get("max_price")
+                    min_s = function_args.get("min_sales")
+                    max_s = function_args.get("max_sales")
+                    sort_b = function_args.get("sort_by")
+                    asc = function_args.get("ascending", False)
+                    
+                    # 로컬 데이터프레임 정렬/필터링 실행
+                    calc_books = query_books_by_numeric_metrics(
+                        df=df,
+                        min_price=min_p,
+                        max_price=max_p,
+                        min_sales=min_s,
+                        max_sales=max_s,
+                        sort_by=sort_b,
+                        ascending=asc
+                    )
+                    
+                    # 도구 실행 결과를 LLM용 컨텍스트로 변환
+                    if not calc_books:
+                        result_str = "조건을 만족하는 도서 목록이 데이터베이스에 없습니다."
+                    else:
+                        result_str = "수치 범위 필터링 및 정렬 조건으로 데이터베이스에서 직접 연산 및 정렬한 결과입니다:\n\n"
+                        for idx, b in enumerate(calc_books):
+                            result_str += (
+                                f"[{idx+1}] 도서명: {b['도서명']}\n"
+                                f"- 순위: {b['순위']}위\n"
+                                f"- 저자: {b['저자']}\n"
+                                f"- 출판사: {b['출판사']}\n"
+                                f"- 출판일: {b['출판일']}\n"
+                                f"- 판매가: {b['판매가']:,}원\n"
+                                f"- 소개내용: {b['내용']}\n"
+                                f"- 상세링크: {b['링크']}\n\n"
+                            )
+                            
+                    # 대화 메시지에 도구 응답 추가
+                    messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": result_str
+                    })
+                    
+            # 2차 호출 (최종 답변 생성)
+            second_response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=2048
+            )
+            return second_response.choices[0].message.content
+        else:
+            # 도구 호출을 수행하지 않은 경우 일반 응답 텍스트 반환
+            return response_message.content
+
     except Exception as e:
-        return f"Groq API 호출 중 오류가 발생했습니다: {str(e)}"
+        return f"Groq API 호출(Tool Calling 포함) 중 오류가 발생했습니다: {str(e)}"
 
 
 def main():
@@ -375,6 +575,31 @@ def main():
         st.error("데이터 파일을 찾을 수 없거나 데이터가 비어 있습니다. 먼저 상세 정보 크롤러를 완료해 주세요.")
         st.info(f"확인 경로: {DATA_FILE}")
         return
+
+    # ChromaDB 매니저 초기화 및 데이터 자동 적재 (RAG 개선)
+    db_manager = ChromaDBManager()
+    if not db_manager.has_data():
+        with st.status("📚 최초 실행: 한국어 klue-bert 모델 기반 벡터 데이터베이스 빌드 중...", expanded=True) as status:
+            st.write("사전학습된 `klue/bert-base` 모델 가중치를 다운로드하고 도서 데이터의 고차원 벡터 변환을 시작합니다.")
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            
+            def progress_cb(current, total, msg):
+                ratio = float(current) / float(total)
+                progress_bar.progress(ratio)
+                status_text.text(f"[{current}/{total}] {msg}")
+                
+            try:
+                db_manager.add_books(df, progress_callback=progress_cb)
+                status.update(label="🎉 벡터 데이터베이스 빌드 완료!", state="complete", expanded=False)
+                progress_bar.empty()
+                status_text.empty()
+                st.toast("RAG 챗봇용 벡터 DB 빌드가 성공적으로 완료되었습니다!", icon="✅")
+            except Exception as e:
+                status.update(label="❌ 빌드 실패", state="error", expanded=True)
+                st.error(f"벡터 데이터베이스 생성 중 오류가 발생했습니다: {str(e)}")
+                progress_bar.empty()
+                status_text.empty()
 
     # 사이드바 설정 (Groq API Key 및 모델)
     st.sidebar.title("🔑 AI 추천 설정")
@@ -666,15 +891,20 @@ def main():
                 # AI 답변 생성
                 with st.chat_message("assistant"):
                     with st.spinner("관련 도서를 검색하고 추천 답변을 생성하고 있습니다..."):
-                        # 1. 관련 도서 검색 (Retrieval)
-                        relevant_books = retrieve_relevant_books(user_input, df)
+                        # 1. 관련 도서 검색 (ChromaDB 벡터 검색)
+                        try:
+                            relevant_books = db_manager.search_similar_books(user_input, top_n=5)
+                        except Exception as e:
+                            # 벡터 검색 중 예외 발생 시 기존 키워드 기반 필터링으로 복구 (안정성 확보)
+                            relevant_books = retrieve_relevant_books(user_input, df)
                         
                         # 2. Groq API 호출을 통한 답변 생성
                         ai_response = recommend_books_via_groq(
                             query=user_input, 
                             relevant_books=relevant_books, 
                             api_key=groq_api_key, 
-                            model=selected_model
+                            model=selected_model,
+                            df=df
                         )
                         st.markdown(ai_response)
                         
